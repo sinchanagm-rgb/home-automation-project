@@ -1,0 +1,95 @@
+import cv2
+import mediapipe as mp
+import serial
+import time
+
+print("Starting...")
+esp = serial.Serial('COM8', 115200)
+time.sleep(2)
+print("Serial OK")
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+def is_peace(hand_landmarks):
+    index_up = hand_landmarks.landmark[8].y < hand_landmarks.landmark[6].y
+    middle_up = hand_landmarks.landmark[12].y < hand_landmarks.landmark[10].y
+    ring_down = hand_landmarks.landmark[16].y > hand_landmarks.landmark[14].y
+    pinky_down = hand_landmarks.landmark[20].y > hand_landmarks.landmark[18].y
+    return index_up and middle_up and ring_down and pinky_down
+
+last_state = None
+print("Entering loop...")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Frame read failed")
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    try:
+        result = hands.process(rgb)
+    except Exception as e:
+        print("MediaPipe error:", e)
+        break
+
+    if result.multi_hand_landmarks:
+        for handLms in result.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+            if is_peace(handLms):
+                if last_state != '1':
+                    esp.write(b'1')
+                    last_state = '1'
+                    print("Peace → 90°")
+                cv2.putText(frame, "PEACE: 90 deg", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            else:
+                if last_state != '0':
+                    esp.write(b'0')
+                    last_state = '0'
+                    print("No gesture → 0°")
+                cv2.putText(frame, "0 deg", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+
+    cv2.imshow("Servo Control", frame)
+    key = cv2.waitKey(1)
+    if key == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+esp.close()
+print("Done.")//////python code
+
+
+
+
+
+#include <ESP32Servo.h>
+Servo myServo;
+
+void setup() {
+  Serial.begin(115200);
+  myServo.attach(5);
+  myServo.write(0);  // start at 0
+}
+
+void loop() {
+  if (Serial.available()) {
+    char data = Serial.read();
+    if (data == '1') {
+      myServo.write(90);  // peace sign → 90°
+    }
+    else if (data == '0') {
+      myServo.write(0);   // no gesture → 0°
+    }
+  }
+}/////arduino code
