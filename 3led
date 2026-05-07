@@ -1,0 +1,145 @@
+#define RED_PIN   25
+#define GREEN_PIN 26
+#define BLUE_PIN  27
+
+void setColor(bool r, bool g, bool b) {
+  digitalWrite(RED_PIN,   r ? LOW : HIGH);
+  digitalWrite(GREEN_PIN, g ? LOW : HIGH);
+  digitalWrite(BLUE_PIN,  b ? LOW : HIGH);
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RED_PIN,   OUTPUT);
+  pinMode(GREEN_PIN, OUTPUT);
+  pinMode(BLUE_PIN,  OUTPUT);
+
+  setColor(0, 0, 0); // all OFF
+}
+
+void loop() {
+  if (Serial.available()) {
+    char data = Serial.read();
+
+    if (data == '1') {
+      setColor(1, 0, 0); // Red
+    }
+    else if (data == '2') {
+      setColor(0, 1, 0); // Green
+    }
+    else if (data == '3') {
+      setColor(0, 0, 1); // Blue
+    }
+    else if (data == '4') {
+      setColor(0, 0, 0); // All OFF
+    }
+  }
+}////arduino code
+
+import cv2
+import mediapipe as mp
+import serial
+import time
+
+print("Starting...")
+esp = serial.Serial('COM8', 115200)
+time.sleep(2)
+print("Serial OK")
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+def count_fingers(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    fingers = 0
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            fingers += 1
+    if hand_landmarks.landmark[4].x < hand_landmarks.landmark[3].x:
+        fingers += 1
+    return fingers
+
+last_state = None
+print("Entering loop...")
+print("1=Red | 2=Green | 3=Blue | 4=All OFF")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera read failed")
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    try:
+        result = hands.process(rgb)
+    except Exception as e:
+        print("MediaPipe error:", e)
+        break
+
+    label = ""
+    color = (255, 255, 255)
+
+    if result.multi_hand_landmarks:
+        for handLms in result.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+            fingers = count_fingers(handLms)
+            print("Fingers detected:", fingers)
+
+            if fingers == 1:
+                label = "1 Finger: RED"
+                color = (0, 0, 255)      # red in BGR
+                if last_state != '1':
+                    esp.write(b'1')
+                    last_state = '1'
+                    print("Sent: Red ON")
+
+            elif fingers == 2:
+                label = "2 Fingers: GREEN"
+                color = (0, 255, 0)      # green
+                if last_state != '2':
+                    esp.write(b'2')
+                    last_state = '2'
+                    print("Sent: Green ON")
+
+            elif fingers == 3:
+                label = "3 Fingers: BLUE"
+                color = (255, 0, 0)      # blue in BGR
+                if last_state != '3':
+                    esp.write(b'3')
+                    last_state = '3'
+                    print("Sent: Blue ON")
+
+            elif fingers == 4:
+                label = "4 Fingers: ALL OFF"
+                color = (100, 100, 100)
+                if last_state != '4':
+                    esp.write(b'4')
+                    last_state = '4'
+                    print("Sent: All OFF")
+
+            else:
+                label = f"Fingers: {fingers}"
+                color = (255, 255, 255)
+
+    if label:
+        cv2.putText(frame, label, (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+    cv2.putText(frame, "1=Red | 2=Green | 3=Blue | 4=OFF",
+                (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    cv2.imshow("Gesture Control", frame)
+    if cv2.waitKey(1) == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+esp.close()
+print("Done.")/////python code
