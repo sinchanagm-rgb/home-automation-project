@@ -1,0 +1,141 @@
+#define RELAY_PIN 22
+#define LED_PIN 26
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // relay off at start (HIGH = OFF for relay)
+  digitalWrite(LED_PIN, LOW);    // light off at start
+}
+
+void loop() {
+  if (Serial.available()) {
+    char data = Serial.read();
+    if (data == '1') {
+      digitalWrite(LED_PIN, HIGH);  // Light ON
+    }
+    else if (data == '2') {
+      digitalWrite(LED_PIN, LOW);   // Light OFF
+    }
+    else if (data == '3') {
+      digitalWrite(RELAY_PIN, LOW); // Fan ON
+    }
+    else if (data == '4') {
+      digitalWrite(RELAY_PIN, HIGH); // Fan OFF
+    }
+  }
+}/////////arduino code
+
+
+
+
+//////////
+import cv2
+import mediapipe as mp
+import serial
+import time
+
+print("Starting...")
+esp = serial.Serial('COM8', 115200)
+time.sleep(2)
+print("Serial OK")
+
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=1)
+mp_draw = mp.solutions.drawing_utils
+
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+def count_fingers(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    fingers = 0
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            fingers += 1
+    # thumb fixed for mirrored camera
+    if hand_landmarks.landmark[4].x < hand_landmarks.landmark[3].x:
+        fingers += 1
+    return fingers
+
+last_state = None
+print("Entering loop...")
+print("1=Light ON | 2=Light OFF | 3=Fan ON | 4=Fan OFF")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera read failed")
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    try:
+        result = hands.process(rgb)
+    except Exception as e:
+        print("MediaPipe error:", e)
+        break
+
+    label = ""
+    color = (255, 255, 255)
+
+    if result.multi_hand_landmarks:
+        for handLms in result.multi_hand_landmarks:
+            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+            fingers = count_fingers(handLms)
+            print("Fingers detected:", fingers)
+
+            if fingers == 1:
+                label = "1 Finger: LIGHT ON"
+                color = (0, 255, 0)
+                if last_state != '1':
+                    esp.write(b'1')
+                    last_state = '1'
+                    print("Sent: Light ON")
+
+            elif fingers == 2:
+                label = "2 Fingers: LIGHT OFF"
+                color = (0, 0, 255)
+                if last_state != '2':
+                    esp.write(b'2')
+                    last_state = '2'
+                    print("Sent: Light OFF")
+
+            elif fingers == 3:
+                label = "3 Fingers: FAN ON"
+                color = (0, 255, 255)
+                if last_state != '3':
+                    esp.write(b'3')
+                    last_state = '3'
+                    print("Sent: Fan ON")
+
+            elif fingers == 4:
+                label = "4 Fingers: FAN OFF"
+                color = (255, 0, 0)
+                if last_state != '4':
+                    esp.write(b'4')
+                    last_state = '4'
+                    print("Sent: Fan OFF")
+
+            else:
+                label = f"Fingers: {fingers} — no action"
+                color = (255, 255, 255)
+
+    if label:
+        cv2.putText(frame, label, (10, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+    cv2.putText(frame, "1=Light ON | 2=Light OFF | 3=Fan ON | 4=Fan OFF",
+                (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    cv2.imshow("Gesture Control", frame)
+    if cv2.waitKey(1) == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+esp.close()
+print("Done.")///////python code
