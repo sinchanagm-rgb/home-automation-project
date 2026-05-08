@@ -1,0 +1,413 @@
+import cv2
+import mediapipe as mp
+import serial
+import time
+import threading
+import os
+from gtts import gTTS
+from playsound import playsound
+import pywhatkit as kit
+from datetime import datetime
+
+# ── CONFIG — edit these ────────────────────────────────────
+WHATSAPP_NUMBER = "+919945571131"   # ← your recipient's number with country code
+WHATSAPP_COOLDOWN = 30              # seconds between WhatsApp sends (avoid spam)
+
+# ── TTS setup ──────────────────────────────────────────────
+tts_lock = threading.Lock()
+tts_active = False
+last_spoke = ""
+last_spoke_time = 0
+speak_cooldown = 3
+
+def speak(text):
+    global tts_active
+    def run():
+        global tts_active
+        with tts_lock:
+            tts_active = True
+            try:
+                filename = "speech.mp3"
+                tts = gTTS(text=text, lang='en')
+                tts.save(filename)
+                playsound(filename)
+                os.remove(filename)
+            except Exception as e:
+                print("TTS error:", e)
+            finally:
+                tts_active = False
+    threading.Thread(target=run, daemon=True).start()
+
+# ── WhatsApp sender ────────────────────────────────────────
+last_whatsapp_time = 0
+whatsapp_lock = threading.Lock()
+
+def send_whatsapp(message):
+    """Send a WhatsApp message in a background thread."""
+    global last_whatsapp_time
+    now = time.time()
+
+    if now - last_whatsapp_time < WHATSAPP_COOLDOWN:
+        remaining = int(WHATSAPP_COOLDOWN - (now - last_whatsapp_time))
+        print(f"WhatsApp cooldown: {remaining}s remaining")
+        return
+
+    last_whatsapp_time = now
+
+    def run():
+        try:
+            now_dt = datetime.now()
+            # Send 1 minute from now to give WhatsApp Web time to open
+            send_hour = now_dt.hour
+            send_min  = now_dt.minute + 2
+            if send_min >= 60:
+                send_min -= 60
+                send_hour = (send_hour + 1) % 24
+
+            print(f"Sending WhatsApp: '{message}' at {send_hour}:{send_min:02d}")
+            kit.sendwhatmsg(
+                WHATSAPP_NUMBER,
+                message,
+                send_hour,
+                send_min,
+                wait_time=15,       # seconds to wait for WhatsApp Web to load
+                tab_close=True,     # close the tab after sending
+                close_time=3
+            )
+            print("WhatsApp sent!")
+        except Exception as e:
+            print("WhatsApp error:", e)
+
+    threading.Thread(target=run, daemon=True).start()
+    speak("WhatsApp message sent")
+
+# ── Serial setup ───────────────────────────────────────────
+print("Starting...")
+esp = serial.Serial('COM8', 115200)
+time.sleep(2)
+print("Serial OK")
+
+# ── MediaPipe setup ────────────────────────────────────────
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(static_image_mode=False, max_num_hands=2)
+mp_draw = mp.solutions.drawing_utils
+
+# ── Camera setup ───────────────────────────────────────────
+cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+# ── Gesture functions ──────────────────────────────────────
+def count_fingers(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    fingers = 0
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            fingers += 1
+    if hand_landmarks.landmark[4].x < hand_landmarks.landmark[3].x:
+        fingers += 1
+    return fingers
+
+def is_fist(hand_landmarks):
+    tips = [8, 12, 16, 20]
+    for tip in tips:
+        if hand_landmarks.landmark[tip].y < hand_landmarks.landmark[tip - 2].y:
+            return False
+    return True
+
+def is_peace(hand_landmarks):
+    index_up   = hand_landmarks.landmark[8].y  < hand_landmarks.landmark[6].y
+    middle_up  = hand_landmarks.landmark[12].y < hand_landmarks.landmark[10].y
+    ring_down  = hand_landmarks.landmark[16].y > hand_landmarks.landmark[14].y
+    pinky_down = hand_landmarks.landmark[20].y > hand_landmarks.landmark[18].y
+    return index_up and middle_up and ring_down and pinky_down
+
+# ── State variables ────────────────────────────────────────
+MODE_HOME = "HOME AUTOMATION"
+MODE_COMM = "COMMUNICATION"
+current_mode = MODE_HOME
+
+last_right = None
+last_left  = None
+mode_switch_time = 0
+SWITCH_COOLDOWN = 3
+
+# WhatsApp gesture hold tracking
+WA_HOLD_SECONDS = 2.0          # hold gesture this long to trigger send
+wa_gesture_start = {}          # gesture_key -> timestamp when hold started
+wa_gesture_triggered = {}      # gesture_key -> bool (already sent this hold?)
+
+def check_wa_hold(key, active, message):
+    """
+    Call every frame. Returns True (and sends WA) the moment the gesture
+    has been held for WA_HOLD_SECONDS without re-triggering until released.
+    """
+    now = time.time()
+    if active:
+        if key not in wa_gesture_start:
+            wa_gesture_start[key] = now
+            wa_gesture_triggered[key] = False
+        elapsed = now - wa_gesture_start[key]
+        if elapsed >= WA_HOLD_SECONDS and not wa_gesture_triggered[key]:
+            wa_gesture_triggered[key] = True
+            send_whatsapp(message)
+            return True
+    else:
+        # gesture released — reset
+        wa_gesture_start.pop(key, None)
+        wa_gesture_triggered.pop(key, None)
+    return False
+
+print("Entering loop...")
+print("Both hands 5 fingers = Switch Mode | ESC = Quit")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("Camera read failed")
+        break
+
+    frame = cv2.flip(frame, 1)
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+    try:
+        result = hands.process(rgb)
+    except Exception as e:
+        print("MediaPipe error:", e)
+        break
+
+    right_label = ""
+    left_label  = ""
+    right_color = (255, 255, 255)
+    left_color  = (255, 255, 0)
+
+    right_fingers = -1
+    left_fingers  = -1
+    right_lms = None
+    left_lms  = None
+
+    now = time.time()
+
+    # ── collect hand data ──────────────────────────────────
+    if result.multi_hand_landmarks and result.multi_handedness:
+        for handLms, handedness in zip(result.multi_hand_landmarks,
+                                       result.multi_handedness):
+            mp_draw.draw_landmarks(frame, handLms, mp_hands.HAND_CONNECTIONS)
+            label = handedness.classification[0].label
+            f = count_fingers(handLms)
+            if label == "Right":
+                right_fingers = f
+                right_lms = handLms
+            elif label == "Left":
+                left_fingers = f
+                left_lms = handLms
+
+    # ── mode switch: BOTH hands 5 fingers ─────────────────
+    if (right_fingers == 5 and left_fingers == 5 and
+            now - mode_switch_time > SWITCH_COOLDOWN):
+
+        last_spoke = ""
+        last_spoke_time = 0
+
+        current_mode = MODE_COMM if current_mode == MODE_HOME else MODE_HOME
+        mode_switch_time = now
+        last_right = None
+        last_left  = None
+
+        msg = f"Switched to {current_mode} mode"
+        print(msg)
+        speak(msg)
+
+    # ══════════════════════════════════════════════════════
+    # MODE 1 — HOME AUTOMATION (unchanged)
+    # ══════════════════════════════════════════════════════
+    elif current_mode == MODE_HOME:
+
+        last_spoke = ""
+
+        if right_lms is not None:
+            fist = is_fist(right_lms)
+
+            if fist:
+                right_label = "RIGHT Fist: FAN OFF"
+                right_color = (100, 100, 100)
+                if last_right != '6':
+                    esp.write(b'6')
+                    last_right = '6'
+                    print("Sent: Fan OFF")
+
+            elif right_fingers == 1:
+                right_label = "RIGHT 1: RED"
+                right_color = (0, 0, 255)
+                if last_right != '1':
+                    esp.write(b'1')
+                    last_right = '1'
+
+            elif right_fingers == 2:
+                right_label = "RIGHT 2: GREEN"
+                right_color = (0, 255, 0)
+                if last_right != '2':
+                    esp.write(b'2')
+                    last_right = '2'
+
+            elif right_fingers == 3:
+                right_label = "RIGHT 3: BLUE"
+                right_color = (255, 0, 0)
+                if last_right != '3':
+                    esp.write(b'3')
+                    last_right = '3'
+
+            elif right_fingers == 4:
+                right_label = "RIGHT 4: LED OFF"
+                right_color = (50, 50, 50)
+                if last_right != '4':
+                    esp.write(b'4')
+                    last_right = '4'
+
+            elif right_fingers == 5:
+                right_label = "RIGHT 5: FAN ON"
+                right_color = (0, 255, 255)
+                if last_right != '5':
+                    esp.write(b'5')
+                    last_right = '5'
+
+        if left_lms is not None:
+            if is_fist(left_lms):
+                left_label = "LEFT Fist: SERVO OFF"
+                left_color = (100, 100, 100)
+                if last_left != '8':
+                    esp.write(b'8')
+                    last_left = '8'
+
+            elif is_peace(left_lms):
+                left_label = "LEFT Peace: SERVO ON"
+                left_color = (255, 255, 0)
+                if last_left != '7':
+                    esp.write(b'7')
+                    last_left = '7'
+
+    # ══════════════════════════════════════════════════════
+    # MODE 2 — COMMUNICATION  (with WhatsApp gestures)
+    # ══════════════════════════════════════════════════════
+    elif current_mode == MODE_COMM:
+
+        msg = ""
+
+        # ── RIGHT HAND ─────────────────────────────────────
+        if right_lms is not None:
+            fist  = is_fist(right_lms)
+            peace = is_peace(right_lms)
+
+            if fist:
+                msg = "I am Okay"
+            elif peace:
+                msg = "I am in Pain"
+            elif right_fingers == 1:
+                msg = "I am Hungry"
+            elif right_fingers == 2:
+                msg = "I am Thirsty"
+            elif right_fingers == 3:
+                msg = "I need Help"
+            elif right_fingers == 4:
+                msg = "I need Medicine"
+            elif right_fingers == 5:
+                msg = "I am Tired"
+
+            if msg:
+                right_label = msg
+                right_color = (0, 255, 255)
+                if (msg != last_spoke and
+                        now - last_spoke_time > speak_cooldown and
+                        not tts_active):
+                    speak(msg)
+                    last_spoke = msg
+                    last_spoke_time = now
+
+        # ── LEFT HAND ──────────────────────────────────────
+        left_msg = ""
+        if left_lms is not None:
+            if left_fingers == 1:
+                left_msg = "I need Toilet"
+            elif left_fingers == 2:
+                left_msg = "I am feeling Cold"
+            elif left_fingers == 3:
+                left_msg = "I am feeling Hot"
+
+            # ── WhatsApp gestures (hold 2 seconds) ─────────
+            elif left_fingers == 4:
+                wa_msg = "EMERGENCY: I need immediate help! Please call me now."
+                active = check_wa_hold("L4", True, wa_msg)
+                # show countdown on screen
+                elapsed = now - wa_gesture_start.get("L4", now)
+                remaining = max(0, WA_HOLD_SECONDS - elapsed)
+                left_label = f"HOLD for WhatsApp SOS ({remaining:.1f}s)"
+                left_color = (0, 0, 255)
+
+            elif left_fingers == 5:
+                wa_msg = "Hi, I need assistance. Please call or come to me."
+                active = check_wa_hold("L5", True, wa_msg)
+                elapsed = now - wa_gesture_start.get("L5", now)
+                remaining = max(0, WA_HOLD_SECONDS - elapsed)
+                left_label = f"HOLD for WhatsApp CALL ({remaining:.1f}s)"
+                left_color = (255, 0, 255)
+
+            else:
+                # reset WA hold if no WA gesture
+                check_wa_hold("L4", False, "")
+                check_wa_hold("L5", False, "")
+
+            if left_msg:
+                left_label = left_msg
+                left_color = (255, 165, 0)
+                # reset WA gestures when doing normal gestures
+                check_wa_hold("L4", False, "")
+                check_wa_hold("L5", False, "")
+                if (left_msg != last_spoke and
+                        now - last_spoke_time > speak_cooldown and
+                        not tts_active):
+                    speak(left_msg)
+                    last_spoke = left_msg
+                    last_spoke_time = now
+
+        else:
+            # no left hand visible — reset WA holds
+            check_wa_hold("L4", False, "")
+            check_wa_hold("L5", False, "")
+
+    # ── draw UI ────────────────────────────────────────────
+    mode_color = (0, 200, 255) if current_mode == MODE_HOME else (200, 0, 255)
+    cv2.rectangle(frame, (0, 0), (640, 40), mode_color, -1)
+    cv2.putText(frame, f"MODE: {current_mode}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 2)
+
+    if right_label:
+        cv2.putText(frame, right_label, (10, 80),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, right_color, 2)
+    if left_label:
+        cv2.putText(frame, left_label, (10, 130),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, left_color, 2)
+
+    if current_mode == MODE_HOME:
+        cv2.putText(frame, "R:1=Red|2=Grn|3=Blu|4=OFF|5=FanON|Fist=FanOFF",
+                    (10, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, "L:Peace=ServoON|Fist=ServoOFF",
+                    (10, 462), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+    else:
+        cv2.putText(frame, "R:1=Hungry|2=Thirsty|3=Help|4=Medicine|5=Tired",
+                    (10, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, "R:Fist=Okay|Peace=Pain  L:1=Toilet|2=Cold|3=Hot",
+                    (10, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+        cv2.putText(frame, "L:4=HOLD SOS WhatsApp | L:5=HOLD CALL WhatsApp",
+                    (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 100, 255), 1)
+
+    cv2.putText(frame, "Both hands 5 fingers = Switch Mode | ESC = Quit",
+                (10, 476), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+
+    cv2.imshow("Gesture Control", frame)
+    if cv2.waitKey(1) == 27:
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+esp.close()
+print("Done.")/////////python code
